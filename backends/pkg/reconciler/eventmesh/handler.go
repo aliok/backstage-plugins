@@ -3,15 +3,15 @@ package eventmesh
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
-	"sort"
-
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/rest"
+	eventingv1beta3 "knative.dev/eventing/pkg/apis/eventing/v1beta3"
 	"knative.dev/eventing/pkg/client/clientset/versioned"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
+	"log"
+	"net/http"
+	"sort"
 
 	"knative.dev/pkg/injection/clients/dynamicclient"
 
@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	lineage "knative.dev/eventing/pkg/graph"
 
 	"k8s.io/apimachinery/pkg/util/json"
 )
@@ -70,24 +71,172 @@ func (h HttpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	config.BearerToken = authHeader[7:]
-	clientset, err := versioned.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Error creating clientset: %v", err)
-	}
+	//clientset, err := versioned.NewForConfig(config)
+	//if err != nil {
+	//	log.Fatalf("Error creating clientset: %v", err)
+	//}
 
-	eventMesh, err := BuildEventMesh(h.ctx, clientset, logger)
+	//eventMesh, err := BuildEventMesh(h.ctx, clientset, logger)
+	//if err != nil {
+	//	logger.Errorw("Error building event mesh", "error", err)
+	//	http.Error(w, err.Error(), http.StatusInternalServerError)
+	//	return
+	//}
+	//
+	//err = json.NewEncoder(w).Encode(eventMesh)
+	//if err != nil {
+	//	logger.Errorw("Error encoding event mesh", "error", err)
+	//	http.Error(w, err.Error(), http.StatusInternalServerError)
+	//	return
+	//}
+
+	eventMesh2, err := BuildEventMesh2(h.ctx, *config, logger)
 	if err != nil {
 		logger.Errorw("Error building event mesh", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	err = json.NewEncoder(w).Encode(eventMesh)
+	err = json.NewEncoder(w).Encode(eventMesh2)
 	if err != nil {
 		logger.Errorw("Error encoding event mesh", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+func BuildEventMesh2(ctx context.Context, restConfig rest.Config, logger *zap.SugaredLogger) (EventMesh, error) {
+	dlogger := logger.Desugar()
+
+	// TODO: drop unnecessary nils and false values
+	config := lineage.ConstructorConfig{
+		RestConfig:            restConfig,
+		Namespaces:            []string{metav1.NamespaceAll},
+		ShouldAddBroker:       nil,
+		FetchBrokers:          true,
+		ShouldAddChannel:      nil,
+		FetchChannels:         false,
+		ShouldAddSource:       nil,
+		FetchSources:          false,
+		ShouldAddTrigger:      nil,
+		FetchTriggers:         true,
+		ShouldAddSubscription: nil,
+		FetchSubscriptions:    false,
+		ShouldAddEventType:    nil,
+		FetchEventTypes:       true,
+	}
+
+	graph, err := lineage.ConstructGraph(ctx, config, *dlogger)
+	if err != nil {
+		// TODO: fix this
+		log.Fatalf("Error constructing graph: %v", err)
+	}
+
+	convertedBrokers := make([]*Broker, 0)
+
+	// build a map for easier access.
+	// we need this map to register the event types in the brokers when we are processing the event types.
+	// map key: "<namespace>/<name>"
+	brokerMap := make(map[string]*Broker)
+
+	convertedEventTypes := make([]*EventType, 0)
+
+	// TODO: logic here is a copy paste from earlier logic, and it MUST be improved
+	for _, v := range graph.Vertices() {
+		if v.Reference().GetRef() == nil {
+			// we don't care about this case yet
+			// TODO: think about URIs:
+			// - No ref, only URI: absolute path
+			// - Ref + URI: relative path
+			// TODO: log
+			continue
+		}
+
+		if schema.FromAPIVersionAndKind(v.Reference().GetRef().APIVersion, "").Group == eventingv1.SchemeGroupVersion.Group && v.Reference().GetRef().Kind == "Broker" {
+			brRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+			broker := brRes.(eventingv1.Broker)
+			cbr := convertBroker(&broker)
+			convertedBrokers = append(convertedBrokers, &cbr)
+			brokerMap[cbr.GetNamespacedName()] = &cbr
+		}
+
+		if schema.FromAPIVersionAndKind(v.Reference().GetRef().APIVersion, "").Group == eventingv1beta3.SchemeGroupVersion.Group && v.Reference().GetRef().Kind == "EventType" {
+			etRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+
+			et := etRes.(eventingv1beta3.EventType)
+
+			cet := convertEventTypev1beta3(&et)
+			// TODO: sorting
+			convertedEventTypes = append(convertedEventTypes, &cet)
+		}
+	}
+
+	// register the event types in the brokers
+	for _, et := range convertedEventTypes {
+		if et.Reference != "" {
+			if br, ok := brokerMap[et.Reference]; ok {
+				br.ProvidedEventTypes = append(br.ProvidedEventTypes, et.NamespacedName())
+			}
+		}
+	}
+
+	// build a map for easier access to the ETs by their namespaced name.
+	// we need this map when processing the triggers to find out ET definitions for the ET references
+	// brokers provide.
+	// map key: "<namespace>/<eventType.name>"
+	etByNamespacedName := make(map[string]*EventType)
+	for _, et := range convertedEventTypes {
+		etByNamespacedName[et.NamespacedName()] = et
+	}
+
+	for _, v := range graph.Vertices() {
+		if v.Reference().GetRef() == nil {
+			// we don't care about this case yet
+			// TODO: think about URIs:
+			// - No ref, only URI: absolute path
+			// - Ref + URI: relative path
+			// TODO: log
+			continue
+		}
+
+		if v.Reference().GetRef().Group == "eventing.knative.dev" && v.Reference().GetRef().Kind == "Trigger" {
+			trRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+
+			err := processTrigger(ctx, trRes.(*eventingv1.Trigger), brokerMap, etByNamespacedName, logger)
+			if err != nil {
+				logger.Errorw("Error processing trigger", "error", err)
+				// do not stop the Backstage plugin from rendering the rest of the data, e.g. because
+				// there are no permissions to get a single subscriber resource
+			}
+		}
+	}
+
+	// TODO: remove
+	//fmt.Println("Graph:")
+	//fmt.Println(graph)
+
+	eventMesh := EventMesh{
+		EventTypes: convertedEventTypes,
+		Brokers:    convertedBrokers,
+	}
+
+	return eventMesh, nil
+}
+
+func GroupFromAPIVersion(apiVersion string) string {
+	return schema.FromAPIVersionAndKind(apiVersion, "").Group
 }
 
 // BuildEventMesh builds the event mesh data by fetching and converting the Kubernetes resources.
