@@ -536,7 +536,7 @@ func TestBuildEventMesh(t *testing.T) {
 		fakeClient := fakeclientset.NewSimpleClientset(v1beta2objects...)
 
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := BuildEventMesh(ctx, fakeClient, logger)
+			got, err := BuildEventMesh(ctx, fakeClient, nil, logger)
 			if (err != nil) != tt.error {
 				t.Errorf("BuildEventMesh() error = %v, error %v", err, tt.error)
 				return
