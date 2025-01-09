@@ -147,7 +147,7 @@ Check that the backend is running:
 kubectl port-forward -n knative-eventing svc/eventmesh-backend 8080:8080
 
 # check that the backend is running
-curl -v http://localhost:8080/
+curl -v http://localhost:8080/getEventMesh
 ```
 
 You will get a `401 Unauthorized` response, which is expected.

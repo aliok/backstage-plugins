@@ -3,12 +3,13 @@ package eventmesh
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"go.uber.org/zap"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
-	"knative.dev/eventing/pkg/client/clientset/versioned"
+	eventingv1beta3 "knative.dev/eventing/pkg/apis/eventing/v1beta3"
+	eventingclient "knative.dev/eventing/pkg/client/clientset/versioned"
+	lineage "knative.dev/eventing/pkg/graph"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -24,33 +25,83 @@ import (
 // see Backstage Kubernetes plugin for more details.
 const BackstageKubernetesIDLabel = "backstage.io/kubernetes-id"
 
-// BuildEventMesh builds the event mesh data by fetching and converting the Kubernetes resources.
-// The procedure is as follows:
-// - Fetch the brokers and convert them to the representation that's consumed by the Backstage plugin.
-// - Do the same for event types.
-// - Fetch the triggers, find out what event types they're subscribed to and find out the resources that are receiving the events.
-// - Make a connection between the event types and the subscribers. Store this connection in the eventType struct.
-func BuildEventMesh(ctx context.Context, clientset versioned.Interface, dynamicClient dynamic.Interface, logger *zap.SugaredLogger) (EventMesh, error) {
-	// fetch the brokers and convert them to the representation that's consumed by the Backstage plugin.
-	convertedBrokers, err := fetchBrokers(clientset, logger)
-	if err != nil {
-		logger.Errorw("Error fetching and converting brokers", "error", err)
-		return EventMesh{}, err
+func BuildEventMesh(ctx context.Context, eventingClient eventingclient.Interface, dynamicClient dynamic.Interface, logger *zap.SugaredLogger) (EventMesh, error) {
+	dlogger := logger.Desugar()
+
+	// TODO: drop unnecessary nils and false values
+	config := lineage.ConstructorConfig{
+		Lenient:               false,
+		EventingClient:        eventingClient,
+		DynamicClient:         dynamicClient,
+		Namespaces:            []string{metav1.NamespaceAll},
+		ShouldAddBroker:       nil,
+		FetchBrokers:          true,
+		ShouldAddChannel:      nil,
+		FetchChannels:         false,
+		ShouldAddSource:       nil,
+		FetchSources:          false,
+		ShouldAddTrigger:      nil,
+		FetchTriggers:         true,
+		ShouldAddSubscription: nil,
+		FetchSubscriptions:    false,
+		ShouldAddEventType:    nil,
+		FetchEventTypes:       true,
 	}
+
+	graph, err := lineage.ConstructGraph(ctx, config, *dlogger)
+	if err != nil {
+		logger.Errorw("Error constructing graph", "error", err)
+		if errors.IsForbidden(err) {
+			return EventMesh{}, fmt.Errorf("permission error while constructing graph: %w", err)
+		}
+		return EventMesh{}, fmt.Errorf("error constructing graph: %w", err)
+	}
+
+	convertedBrokers := make([]*Broker, 0)
 
 	// build a map for easier access.
 	// we need this map to register the event types in the brokers when we are processing the event types.
 	// map key: "<namespace>/<name>"
 	brokerMap := make(map[string]*Broker)
-	for _, cbr := range convertedBrokers {
-		brokerMap[cbr.GetNamespacedName()] = cbr
-	}
 
-	// fetch the event types and convert them to the representation that's consumed by the Backstage plugin.
-	convertedEventTypes, err := fetchEventTypes(clientset, logger)
-	if err != nil {
-		logger.Errorw("Error fetching and converting event types", "error", err)
-		return EventMesh{}, err
+	convertedEventTypes := make([]*EventType, 0)
+
+	// TODO: logic here is a copy paste from earlier logic, and it MUST be improved
+	for _, v := range graph.Vertices() {
+		if v.Reference().GetRef() == nil {
+			// we don't care about this case yet
+			// TODO: think about URIs:
+			// - No ref, only URI: absolute path
+			// - Ref + URI: relative path
+			// TODO: log
+			continue
+		}
+
+		if schema.FromAPIVersionAndKind(v.Reference().GetRef().APIVersion, "").Group == eventingv1.SchemeGroupVersion.Group && v.Reference().GetRef().Kind == "Broker" {
+			brRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+			broker := brRes.(eventingv1.Broker)
+			cbr := convertBroker(&broker)
+			convertedBrokers = append(convertedBrokers, &cbr)
+			brokerMap[cbr.GetNamespacedName()] = &cbr
+		}
+
+		if schema.FromAPIVersionAndKind(v.Reference().GetRef().APIVersion, "").Group == eventingv1beta3.SchemeGroupVersion.Group && v.Reference().GetRef().Kind == "EventType" {
+			etRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+
+			et := etRes.(eventingv1beta3.EventType)
+
+			cet := convertEventTypev1beta3(&et)
+			// TODO: sorting
+			convertedEventTypes = append(convertedEventTypes, &cet)
+		}
 	}
 
 	// register the event types in the brokers
@@ -62,14 +113,6 @@ func BuildEventMesh(ctx context.Context, clientset versioned.Interface, dynamicC
 		}
 	}
 
-	// fetch the triggers we will process them later
-	triggers, err := clientset.EventingV1().Triggers(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
-
-	if err != nil {
-		logger.Errorw("Error listing triggers", "error", err)
-		return EventMesh{}, err
-	}
-
 	// build a map for easier access to the ETs by their namespaced name.
 	// we need this map when processing the triggers to find out ET definitions for the ET references
 	// brokers provide.
@@ -79,14 +122,54 @@ func BuildEventMesh(ctx context.Context, clientset versioned.Interface, dynamicC
 		etByNamespacedName[et.NamespacedName()] = et
 	}
 
-	for _, trigger := range triggers.Items {
-		err := processTrigger(ctx, &trigger, brokerMap, etByNamespacedName, dynamicClient, logger)
-		if err != nil {
-			logger.Errorw("Error processing trigger", "error", err)
-			// do not stop the Backstage plugin from rendering the rest of the data, e.g. because
-			// there are no permissions to get a single subscriber resource
+	for _, v := range graph.Vertices() {
+		if v.Reference().GetRef() == nil {
+			// we don't care about this case yet
+			// TODO: think about URIs:
+			// - No ref, only URI: absolute path
+			// - Ref + URI: relative path
+			// TODO: log
+			continue
+		}
+
+		if v.Reference().GetRef().Group == "eventing.knative.dev" && v.Reference().GetRef().Kind == "Trigger" {
+			trRes, ok := v.Resource()
+			if !ok {
+				// TODO: log
+				continue
+			}
+
+			err := processTrigger(ctx, trRes.(*eventingv1.Trigger), brokerMap, etByNamespacedName, nil, logger)
+			if err != nil {
+				logger.Errorw("Error processing trigger", "error", err)
+				// do not stop the Backstage plugin from rendering the rest of the data, e.g. because
+				// there are no permissions to get a single subscriber resource
+			}
 		}
 	}
+
+	for _, e := range graph.Edges() {
+		if e.Reference().GetRef() == nil {
+			// we don't care about this case yet
+			// TODO:
+			continue
+		}
+
+		if e.Reference().GetRef().Group == "eventing.knative.dev" && e.Reference().GetRef().Kind == "Trigger" {
+			e.From().Lineage()
+		}
+	}
+
+	fmt.Println("\n\nLineage:")
+	vertices := graph.Lineage()
+	for _, v := range vertices {
+		fmt.Println(v)
+	}
+	fmt.Println("\n\ndone")
+
+	// TODO: remove
+	fmt.Println("Graph:")
+	fmt.Println(graph)
 
 	outputEventTypes := make([]EventType, 0, len(convertedEventTypes))
 	for _, et := range convertedEventTypes {
@@ -103,8 +186,15 @@ func BuildEventMesh(ctx context.Context, clientset versioned.Interface, dynamicC
 	}
 
 	return eventMesh, nil
+
 }
 
+// BuildEventMesh builds the event mesh data by fetching and converting the Kubernetes resources.
+// The procedure is as follows:
+// - Fetch the brokers and convert them to the representation that's consumed by the Backstage plugin.
+// - Do the same for event types.
+// - Fetch the triggers, find out what event types they're subscribed to and find out the resources that are receiving the events.
+// - Make a connection between the event types and the subscribers. Store this connection in the eventType struct.
 // processTrigger processes the trigger and updates the ETs that the trigger is subscribed to.
 // The consumedBy fields of ETs are updated with the subscriber's Backstage ID.
 func processTrigger(ctx context.Context, trigger *eventingv1.Trigger, brokerMap map[string]*Broker, etByNamespacedName map[string]*EventType, dynamicClient dynamic.Interface, logger *zap.SugaredLogger) error {
@@ -197,47 +287,7 @@ func collectSubscribedEventTypes(trigger *eventingv1.Trigger, broker *Broker, et
 }
 
 // fetchBrokers fetches the brokers and converts them to the representation that's consumed by the Backstage plugin.
-func fetchBrokers(clientset versioned.Interface, logger *zap.SugaredLogger) ([]*Broker, error) {
-	brokers, err := clientset.EventingV1().Brokers(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
-
-	if err != nil {
-		logger.Errorw("Error listing brokers", "error", err)
-		return nil, err
-	}
-
-	convertedBrokers := make([]*Broker, 0, len(brokers.Items))
-	for _, br := range brokers.Items {
-		convertedBroker := convertBroker(&br)
-		convertedBrokers = append(convertedBrokers, &convertedBroker)
-	}
-	return convertedBrokers, err
-}
-
 // fetchEventTypes fetches the event types and converts them to the representation that's consumed by the Backstage plugin.
-func fetchEventTypes(clientset versioned.Interface, logger *zap.SugaredLogger) ([]*EventType, error) {
-	eventTypeResponse, err := clientset.EventingV1beta2().EventTypes(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		logger.Errorw("Error listing eventTypes", "error", err)
-		return nil, err
-	}
-	eventTypes := eventTypeResponse.Items
-
-	sort.Slice(eventTypes, func(i, j int) bool {
-		if eventTypes[i].Namespace != eventTypes[j].Namespace {
-			return eventTypes[i].Namespace < eventTypes[j].Namespace
-		}
-		return eventTypes[i].Name < eventTypes[j].Name
-	})
-
-	convertedEventTypes := make([]*EventType, 0, len(eventTypes))
-	for _, et := range eventTypes {
-		convertedEventType := convertEventType(&et)
-		convertedEventTypes = append(convertedEventTypes, &convertedEventType)
-	}
-
-	return convertedEventTypes, err
-}
-
 // getSubscriberBackstageId fetches the subscriber resource and returns the Backstage ID if it's present.
 func getSubscriberBackstageId(ctx context.Context, client dynamic.Interface, subRef *duckv1.KReference, logger *zap.SugaredLogger) (string, error) {
 	refGvr, _ := meta.UnsafeGuessKindToResource(schema.FromAPIVersionAndKind(subRef.APIVersion, subRef.Kind))
