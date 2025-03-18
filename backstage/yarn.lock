@@ -7281,7 +7281,7 @@
   dependencies:
     buffer "^6.0.3"
 
-"@knative-extensions/plugin-knative-event-mesh-backend@link:plugins/knative-event-mesh-backend":
+"@knative-extensions/plugin-knative-event-mesh-backend@file:plugins/knative-event-mesh-backend":
   version "0.0.0-nightly"
   dependencies:
     "@backstage/backend-common" "^0.25.0"
@@ -12672,7 +12672,7 @@ anymatch@^3.0.3, anymatch@~3.1.2:
     normalize-path "^3.0.0"
     picomatch "^2.0.4"
 
-"app@link:packages/app":
+"app@file:packages/app":
   version "0.0.0"
   dependencies:
     "@backstage-community/plugin-github-actions" "^0.6.16"
